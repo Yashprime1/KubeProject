@@ -1,0 +1,163 @@
+name: Deploy to AWS EKS
+
+on:
+  workflow_run:
+    workflows: ["Build and Push Docker Image"]
+    types:
+      - completed
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      cluster_name:
+        description: 'EKS Cluster Name'
+        required: true
+        default: 'my-eks-cluster'
+
+env:
+  IMAGE_NAME: yashprime07/static-site
+  KUBE_NAMESPACE: default
+  AWS_REGION: eu-west-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+      with:
+        role-to-assume: arn:aws:iam::736548753645:role/GithubRole
+        aws-region: eu-west-1
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl for EKS
+      run: |
+        CLUSTER_NAME="${{ github.event.inputs.cluster_name || 'floral-folk-goose' }}"
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name $CLUSTER_NAME
+
+    - name: Set environment variables
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "ENVIRONMENT=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+        else
+          echo "ENVIRONMENT=staging" >> $GITHUB_ENV
+        fi
+        echo "IMAGE_TAG=latest" >> $GITHUB_ENV
+        echo "DEPLOYMENT_NAME=static-site-${{ env.ENVIRONMENT }}" >> $GITHUB_ENV
+
+    - name: Replace placeholders in K8s manifests
+      run: |
+        sed -i "s|{{IMAGE_NAME}}|${{ env.IMAGE_NAME }}|g" kube-templates/deployment.yaml
+        sed -i "s|{{IMAGE_TAG}}|${{ env.IMAGE_TAG }}|g" kube-templates/deployment.yaml
+        sed -i "s|{{ENVIRONMENT}}|${{ env.ENVIRONMENT }}|g" kube-templates/deployment.yaml
+        sed -i "s|{{DEPLOYMENT_NAME}}|${{ env.DEPLOYMENT_NAME }}|g" kube-templates/deployment.yaml
+
+    - name: Verify EKS cluster connection
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+        echo "✅ Successfully connected to EKS cluster"
+
+    - name: Create namespace if it doesn't exist
+      run: |
+        kubectl create namespace ${{ env.KUBE_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Deploy to EKS
+      run: |
+        kubectl apply -f kube-templates/ -n ${{ env.KUBE_NAMESPACE }}
+
+    - name: Wait for deployment to be ready
+      run: |
+        kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+
+    - name: Get deployment status
+      run: |
+        kubectl get deployment ${{ env.DEPLOYMENT_NAME }} -n ${{ env.KUBE_NAMESPACE }} -o wide
+        kubectl get pods -l app=static-site,environment=${{ env.ENVIRONMENT }} -n ${{ env.KUBE_NAMESPACE }} -o wide
+
+    - name: Get service information
+      run: |
+        kubectl get svc static-site-service-${{ env.ENVIRONMENT }} -n ${{ env.KUBE_NAMESPACE }} -o wide
+        
+        # Get LoadBalancer URL if available
+        EXTERNAL_IP=$(kubectl get svc static-site-service-${{ env.ENVIRONMENT }} -n ${{ env.KUBE_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+        if [ ! -z "$EXTERNAL_IP" ]; then
+          echo "🌐 Application URL: http://$EXTERNAL_IP"
+        else
+          echo "⏳ LoadBalancer is provisioning... Check AWS console for ELB status"
+        fi
+
+    - name: Deployment summary
+      run: |
+        echo "🚀 Deployment completed successfully!"
+        echo "📦 Image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+        echo "🏷️  Environment: ${{ env.ENVIRONMENT }}"
+        echo "📝 Pod Name: ${{ env.DEPLOYMENT_NAME }}"
+        echo "🔍 Namespace: ${{ env.KUBE_NAMESPACE }}"
+
+  health-check:
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: success()
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Configure kubectl for EKS
+      run: |
+        CLUSTER_NAME="${{ github.event.inputs.cluster_name || 'my-eks-cluster' }}"
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name $CLUSTER_NAME
+
+    - name: Health check
+      run: |
+        # Wait a bit for the deployment to fully start
+        sleep 30
+        
+        # Check deployment status
+        DEPLOYMENT_STATUS=$(kubectl get deployment static-site-${{ env.ENVIRONMENT }} -n ${{ env.KUBE_NAMESPACE }} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}')
+        echo "Deployment status: $DEPLOYMENT_STATUS"
+        
+        if [ "$DEPLOYMENT_STATUS" = "True" ]; then
+          echo "✅ Deployment is running successfully!"
+          
+          # Get pod information
+          kubectl get pods -l app=static-site,environment=${{ env.ENVIRONMENT }} -n ${{ env.KUBE_NAMESPACE }}
+          
+          # Check service and get LoadBalancer URL
+          EXTERNAL_IP=$(kubectl get svc static-site-service-${{ env.ENVIRONMENT }} -n ${{ env.KUBE_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          if [ ! -z "$EXTERNAL_IP" ]; then
+            echo "🌐 Application accessible at: http://$EXTERNAL_IP"
+            
+            # Optional: Test HTTP endpoint
+            echo "🔍 Testing HTTP endpoint..."
+            curl -f -s -o /dev/null http://$EXTERNAL_IP || echo "⚠️  HTTP test failed (LoadBalancer might still be provisioning)"
+          else
+            echo "⏳ LoadBalancer is still provisioning..."
+          fi
+        else
+          echo "❌ Deployment failed. Status: $DEPLOYMENT_STATUS"
+          kubectl describe deployment static-site-${{ env.ENVIRONMENT }} -n ${{ env.KUBE_NAMESPACE }}
+          kubectl logs -l app=static-site,environment=${{ env.ENVIRONMENT }} -n ${{ env.KUBE_NAMESPACE }} --tail=50
+          exit 1
+        fi
