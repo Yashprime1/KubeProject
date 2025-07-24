@@ -63,7 +63,7 @@ jobs:
           echo "ENVIRONMENT=staging" >> $GITHUB_ENV
         fi
         echo "IMAGE_TAG=latest" >> $GITHUB_ENV
-        echo "DEPLOYMENT_NAME=static-site-${{ env.ENVIRONMENT }}" >> $GITHUB_ENV
+        echo "DEPLOYMENT_NAME=static-site-${{ github.event.inputs.environment }}" >> $GITHUB_ENV
 
     - name: Replace placeholders in K8s manifests
       run: |
