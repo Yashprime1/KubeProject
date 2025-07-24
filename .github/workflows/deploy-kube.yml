@@ -75,7 +75,6 @@ jobs:
     - name: Verify EKS cluster connection
       run: |
         kubectl cluster-info
-        kubectl get nodes
         echo "✅ Successfully connected to EKS cluster"
 
     - name: Create namespace if it doesn't exist
