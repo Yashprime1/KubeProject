@@ -59,11 +59,13 @@ jobs:
       run: |
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           echo "ENVIRONMENT=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+          export ENVIRONMENT="${{ github.event.inputs.environment }}"
         else
           echo "ENVIRONMENT=staging" >> $GITHUB_ENV
+          export ENVIRONMENT="staging"
         fi
         echo "IMAGE_TAG=latest" >> $GITHUB_ENV
-        echo "DEPLOYMENT_NAME=static-site-${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+        echo "DEPLOYMENT_NAME=static-site-${ENVIRONMENT}" >> $GITHUB_ENV
 
     - name: Replace placeholders in K8s manifests
       run: |
